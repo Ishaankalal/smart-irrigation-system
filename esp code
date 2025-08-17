@@ -1,0 +1,144 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// ---- WiFi + MQTT ----
+const char* ssid = "Ishaan";
+const char* password = "123456789";
+const char* mqtt_server = "broker.hivemq.com";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ---- Pins ----
+#define SOIL_PIN 34
+#define MOTOR_PIN 26
+
+// ---- Global vars ----
+int soilMoisture = 0;
+int lastSoilMoisture = 0;
+int temperature = 0;
+
+// ---- Task Handles ----
+TaskHandle_t sensorTaskHandle;
+TaskHandle_t motorTaskHandle;
+TaskHandle_t commTaskHandle;
+
+// ---- Motor state ----
+bool motorOn = false;
+
+// ---- Function: Connect WiFi ----
+void setup_wifi() {
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("WiFi connected");
+}
+
+// ---- Function: Connect MQTT ----
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect("ESP32Client")) {
+      Serial.println("connected");
+    } else {
+      delay(2000);
+    }
+  }
+}
+
+// ---- Sensor Task (every 30s) ----
+void sensorTask(void *pvParameters) {
+  for (;;) {
+    lastSoilMoisture = soilMoisture;
+    soilMoisture = analogRead(SOIL_PIN) / 40;  // scale 0–100%
+    Serial.printf("[Sensor Task] Moisture = %d\n", soilMoisture);
+
+    // Decide motor action
+    if (soilMoisture < 20) {
+      xTaskNotifyGive(motorTaskHandle); // Tell motor to turn ON
+    } else if (soilMoisture > 50) {
+      xTaskNotify(motorTaskHandle, 1, eSetValueWithOverwrite); // Turn OFF
+    }
+
+    // Notify comm task if soil >20%
+    if (soilMoisture > 20) {
+      xTaskNotifyGive(commTaskHandle);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(30000)); // 30 sec delay
+  }
+}
+
+// ---- Motor Task ----
+void motorTask(void *pvParameters) {
+  for (;;) {
+    uint32_t val = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    if (val > 0) {
+      // Turn ON
+      digitalWrite(MOTOR_PIN, HIGH);
+      motorOn = true;
+      Serial.println("[Motor Task] Motor ON");
+
+      // Save moisture before running
+      int before = soilMoisture;
+      vTaskDelay(pdMS_TO_TICKS(10000)); // run motor for 10 sec
+      int after = analogRead(SOIL_PIN) / 40;
+
+      if (after <= before) {
+        // No improvement in soil moisture → Single Alert Topic
+        if (!client.connected()) reconnect();
+        client.loop();
+        client.publish("esp32/alert", "Motor ON 10s but moisture not increased!");
+        Serial.println("[Motor Task] ALERT published!");
+      }
+    }
+
+    // Check if special notify to turn OFF
+    uint32_t offSignal;
+    if (xTaskNotifyWait(0, 0, &offSignal, 0) == pdTRUE && offSignal == 1) {
+      digitalWrite(MOTOR_PIN, LOW);
+      motorOn = false;
+      Serial.println("[Motor Task] Motor OFF");
+    }
+  }
+}
+
+// ---- Communication Task (every 1 min or notified) ----
+void commTask(void *pvParameters) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(60000)); // wait
+
+    if (!client.connected()) {
+      reconnect();
+    }
+    client.loop();
+
+    char payload[64];
+    snprintf(payload, sizeof(payload), "{\"soil\":%d, \"temp\":%d}", soilMoisture, temperature);
+    client.publish("esp32/farm", payload);
+
+    Serial.printf("[Comm Task] Published: %s\n", payload);
+  }
+}
+
+// ---- Setup ----
+void setup() {
+  Serial.begin(115200);
+  pinMode(MOTOR_PIN, OUTPUT);
+  digitalWrite(MOTOR_PIN, LOW);
+
+  setup_wifi();
+  client.setServer(mqtt_server, 1883);
+
+  // Create FreeRTOS tasks
+  xTaskCreatePinnedToCore(sensorTask, "SensorTask", 4096, NULL, 1, &sensorTaskHandle, 1);
+  xTaskCreatePinnedToCore(motorTask,  "MotorTask",  4096, NULL, 2, &motorTaskHandle, 1);
+  xTaskCreatePinnedToCore(commTask,   "CommTask",   4096, NULL, 1, &commTaskHandle, 0);
+}
+
+void loop() {
+  // Empty – all handled by FreeRTOS
+}
